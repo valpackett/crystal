@@ -12,13 +12,17 @@ class IO::FileDescriptor
   @write_timeout : Float64?
   @read_event : Event::Event?
   @write_event : Event::Event?
+  @fiber_safe : Bool
+  @write_mutex : Mutex?
 
   # :nodoc:
   property read_timed_out : Bool
   property write_timed_out : Bool
 
-  def initialize(fd, blocking = false, edge_triggerable = false)
+  def initialize(fd, blocking = false, edge_triggerable = false, flush_on_newline = false, fiber_safe = false)
     @edge_triggerable = !!edge_triggerable
+    @flush_on_newline = !!flush_on_newline
+    @fiber_safe = !!fiber_safe
     @closed = false
     @read_timed_out = false
     @write_timed_out = false
@@ -99,14 +103,18 @@ class IO::FileDescriptor
 
   # :nodoc:
   def resume_read
-    if reader = @readers.try &.shift?
+    readers = @readers
+    if readers && (reader = readers.shift?)
+      add_read_event unless readers.empty?
       reader.resume
     end
   end
 
   # :nodoc:
   def resume_write
-    if writer = @writers.try &.shift?
+    writers = @writers
+    if writers && (writer = writers.shift?)
+      add_write_event unless writers.empty?
       writer.resume
     end
   end
@@ -224,35 +232,72 @@ class IO::FileDescriptor
         raise Errno.new "Error reading file"
       end
     end
-  ensure
-    if (readers = @readers) && !readers.empty?
-      add_read_event
+  end
+
+  # We want `puts`, which is composed of the write of an object
+  # and then a newline, to be atomic, so we wait in a similar
+  # way to how we do it in `write`.
+  #
+  # Here we repeat puts definition because of bug #2318,
+  # but also because doing `puts 1, 2, 3` we don't want to
+  # invoke `puts` because we want to invoke `wait_writable_if_writers`
+  # just once.
+
+  # :nodoc:
+  def puts(string : String) : Nil
+    synchronize_write do
+      self << string
+      puts unless string.ends_with?('\n')
     end
+    nil
+  end
+
+  # :nodoc:
+  def puts(obj) : Nil
+    synchronize_write do
+      self << obj
+      puts
+    end
+    nil
+  end
+
+  def puts(*objects : _) : Nil
+    synchronize_write do
+      objects.each do |obj|
+        puts obj
+      end
+    end
+    nil
+  end
+
+  def write(slice : Slice(UInt8))
+    synchronize_write do
+      super
+    end
+    nil
   end
 
   private def unbuffered_write(slice : Slice(UInt8))
-    count = slice.size
-    total = count
-    loop do
-      bytes_written = LibC.write(@fd, slice.pointer(count), count)
-      if bytes_written != -1
-        count -= bytes_written
-        return total if count == 0
-        slice += bytes_written
-      else
-        if Errno.value == Errno::EAGAIN
-          wait_writable
-          next
-        elsif Errno.value == Errno::EBADF
-          raise IO::Error.new "File not open for writing"
+    synchronize_write do
+      count = slice.size
+      total = count
+      loop do
+        bytes_written = LibC.write(@fd, slice.pointer(count), count)
+        if bytes_written != -1
+          count -= bytes_written
+          return total if count == 0
+          slice += bytes_written
         else
-          raise Errno.new "Error writing file"
+          if Errno.value == Errno::EAGAIN
+            wait_writable(front: true)
+            next
+          elsif Errno.value == Errno::EBADF
+            raise IO::Error.new "File not open for writing"
+          else
+            raise Errno.new "Error writing file"
+          end
         end
       end
-    end
-  ensure
-    if (writers = @writers) && !writers.empty?
-      add_write_event
     end
   end
 
@@ -281,14 +326,25 @@ class IO::FileDescriptor
     nil
   end
 
-  private def wait_writable(timeout = @write_timeout)
-    wait_writable(timeout: timeout) { |err| raise err }
+  private def wait_writable_if_writers
+    if (writers = @writers) && !writers.empty?
+      wait_writable
+    end
+  end
+
+  private def wait_writable(timeout = @write_timeout, front = false)
+    wait_writable(timeout: timeout, front: front) { |err| raise err }
   end
 
   # msg/timeout are overridden in nonblock_connect
-  private def wait_writable(msg = "write timed out", timeout = @write_timeout)
+  private def wait_writable(msg = "write timed out", timeout = @write_timeout, front = false)
     writers = (@writers ||= Deque(Fiber).new)
-    writers << Fiber.current
+
+    if front
+      writers.unshift Fiber.current
+    else
+      writers << Fiber.current
+    end
     add_write_event timeout
     Scheduler.reschedule
 
@@ -305,6 +361,21 @@ class IO::FileDescriptor
     event = @write_event ||= Scheduler.create_fd_write_event(self)
     event.add timeout
     nil
+  end
+
+  # :nodoc:
+  def fiber_safe=(@fiber_safe : Bool)
+  end
+
+  private def synchronize_write
+    if @fiber_safe
+      write_mutex = @write_mutex ||= Mutex.new
+      write_mutex.synchronize do
+        yield
+      end
+    else
+      yield
+    end
   end
 
   private def unbuffered_rewind
