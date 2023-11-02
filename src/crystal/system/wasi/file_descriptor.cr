@@ -21,7 +21,13 @@ module Crystal::System::FileDescriptor
   end
 
   private def system_reopen(other : IO::FileDescriptor)
-    raise NotImplementedError.new "Crystal::System::FileDescriptor#system_reopen"
+    err = LibWasi.fd_renumber(other.fd, fd)
+    raise RuntimeError.from_os_error("fd_renumber", err) unless err.success?
+
+    # Mark the handle open, since we had to have dup'd a live handle.
+    @closed = false
+
+    evented_reopen
   end
 
   private def system_echo(enable : Bool, & : ->)
